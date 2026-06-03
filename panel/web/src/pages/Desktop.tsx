@@ -53,6 +53,8 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const dragDepth = useRef(0);
   const lastBeat = useRef(0);
   const lastImeError = useRef(0);
+  const lastPasteBridge = useRef({ text: '', at: 0 });
+  const lastPasteError = useRef(0);
 
   const inst = instances.find((i) => i.id === id);
   // 进入实例时，共享列表可能尚未同步（管理页新建/安装后），先按"探测中"显示加载态，
@@ -185,6 +187,91 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       }
     };
   }, [showVnc, id, frameLoaded]);
+
+  // Firefox 不允许普通网页可靠地后台读取系统剪贴板；但用户按 Ctrl+V 时，paste 事件会携带本次剪贴板文本。
+  // 在 VNC 获得焦点后捕获该事件，把本地文本同步到 KasmVNC/noVNC 自带剪贴板 textarea，供容器内应用再 Ctrl+V 使用。
+  useEffect(() => {
+    if (!showVnc || !frameLoaded || !id) return;
+
+    const frame = frameRef.current;
+    const frameDoc = (() => {
+      try {
+        return frame?.contentDocument || null;
+      } catch {
+        return null;
+      }
+    })();
+
+    const elementFromTarget = (target: EventTarget | null): Element | null => {
+      const node = target as (Node & { parentElement?: Element | null }) | null;
+      if (!node) return null;
+      if (node.nodeType === 1) return node as unknown as Element;
+      return node.parentElement || null;
+    };
+
+    const isHostEditableOrPanel = (target: EventTarget | null) => {
+      const el = elementFromTarget(target);
+      if (!el) return false;
+      const htmlEl = el as HTMLElement;
+      return !!(
+        htmlEl.isContentEditable ||
+        el.closest('.iv-files') ||
+        el.closest('input, textarea, select, [contenteditable]')
+      );
+    };
+
+    const restoreVncFocus = (target: EventTarget | null) => {
+      const el = elementFromTarget(target);
+      if (el?.id === 'noVNC_clipboard_text') return;
+      window.setTimeout(() => focusFrame(), 0);
+    };
+
+    const bridgePaste = (source: 'host' | 'vnc') => (event: ClipboardEvent) => {
+      if (source === 'host') {
+        if (isHostEditableOrPanel(event.target)) return;
+        if (document.activeElement !== frame) return;
+      }
+
+      const text = event.clipboardData?.getData('text/plain') || '';
+      if (!text) return;
+
+      const now = Date.now();
+      if (lastPasteBridge.current.text === text && now - lastPasteBridge.current.at < 400) return;
+      lastPasteBridge.current = { text, at: now };
+      setClipText(text);
+
+      if (!pushClipboardToRemote(text)) {
+        if (now - lastPasteError.current > 3000) {
+          lastPasteError.current = now;
+          toast('自动发送剪贴板失败：桌面尚未连接', 'error');
+        }
+        return;
+      }
+
+      if (source === 'vnc') {
+        event.preventDefault();
+        restoreVncFocus(event.target);
+      }
+    };
+
+    const hostPaste = bridgePaste('host') as EventListener;
+    const vncPaste = bridgePaste('vnc') as EventListener;
+    const options: AddEventListenerOptions = { capture: true };
+    const listeners: Array<[EventTarget, EventListener]> = [];
+    const addPasteListener = (target: EventTarget | null, listener: EventListener) => {
+      if (!target) return;
+      target.addEventListener('paste', listener, options);
+      listeners.push([target, listener]);
+    };
+
+    addPasteListener(document, hostPaste);
+    addPasteListener(window, hostPaste);
+    addPasteListener(frameDoc, vncPaste);
+
+    return () => {
+      listeners.forEach(([target, listener]) => target.removeEventListener('paste', listener, true));
+    };
+  }, [showVnc, frameLoaded, id]);
 
   if (!id) {
     nav('/', { replace: true });
@@ -665,7 +752,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 ↓ 读取容器剪贴板到此框
               </button>
               <div className="files-hint">
-                局域网 http 访问时浏览器会禁用系统级剪贴板同步，故用此框中转：文本→容器剪贴板，再在微信里 Ctrl+V。
+                Firefox 下按 Ctrl+V 时会自动发送文本到容器剪贴板。局域网 http 访问时浏览器会禁用系统级剪贴板同步，故也可用此框中转。
               </div>
             </div>
           )}
